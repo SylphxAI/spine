@@ -1,7 +1,7 @@
 name: ci
 
 # One build per pull request, shared by every job that needs the binary.
-# The merge queue runs only what the queue adds (macOS and Windows tests),
+# The merge queue runs only what the queue adds (Windows tests, under wine),
 # never the pull request checks a second time. `ci` is the one required check.
 
 on:
@@ -19,7 +19,7 @@ concurrency:
 jobs:
   changes:
     if: github.event_name != 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: sylphx-linux-standard
     timeout-minutes: 5
     outputs:
       db: ${{ steps.f.outputs.db }}
@@ -44,7 +44,7 @@ jobs:
 
   build:
     if: github.event_name != 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: sylphx-linux-standard
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -62,10 +62,13 @@ jobs:
 
   checks:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: sylphx-linux-standard
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: '1.4.0'
@@ -136,7 +139,7 @@ jobs:
 
   action:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: sylphx-linux-standard
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -152,7 +155,7 @@ jobs:
   live-db:
     needs: [changes, build]
     if: needs.changes.outputs.db == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sylphx-linux-standard
     timeout-minutes: 15
     services:
       postgres:
@@ -172,6 +175,8 @@ jobs:
           name: repomap-linux-x64
           path: bin
       - run: chmod +x bin/repomap
+      - name: Database clients
+        run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends postgresql-client mysql-client >/dev/null
       - name: Seed schemas
         run: |
           set -euo pipefail
@@ -205,7 +210,7 @@ jobs:
   docker:
     needs: [changes, build]
     if: needs.changes.outputs.docker == 'true'
-    runs-on: ubuntu-latest
+    runs-on: sylphx-linux-standard
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -233,7 +238,7 @@ jobs:
 
   plain-language:
     if: github.event_name != 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: sylphx-linux-standard
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -241,28 +246,42 @@ jobs:
           fetch-depth: 0
       - uses: SylphxAI/.github/.github/actions/plain-language@f9176dad2e49c6b99d75f1506fafac84632fe870
 
-  # Queue-only: the platforms a pull request does not need to wait for. A
-  # plain name: GitHub adds the matrix value, and a skipped run does not show
-  # an unexpanded `${{ matrix.os }}`.
-  other-os:
-    if: github.event_name == 'merge_group'
-    name: test other OS
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [macos-latest, windows-latest]
+  # Queue-only, and on demand: Windows. The tests are cross-compiled to MSVC
+  # on Linux and run under wine. No macOS lane: we host no Apple hardware yet,
+  # and the release workflow checks the Apple binaries.
+  windows:
+    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    name: test windows (wine)
+    runs-on: sylphx-linux-standard
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --locked --workspace
+        with:
+          key: windows
+      - name: cargo-xwin, clang and wine
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/xwin.tgz" https://github.com/rust-cross/cargo-xwin/releases/download/v0.23.1/cargo-xwin-v0.23.1.x86_64-unknown-linux-musl.tar.gz
+          echo "c492c6dfb7e5ac0eee586b796e0fc950ba13077e7f0bbb046f445d71790d5360  $RUNNER_TEMP/xwin.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          tar -xzf "$RUNNER_TEMP/xwin.tgz" -C "$RUNNER_TEMP/bin" cargo-xwin
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends clang wine wine64 >/dev/null
+      - run: cargo xwin test --locked --workspace --target x86_64-pc-windows-msvc
+        env:
+          XWIN_ACCEPT_LICENSE: '1'
+          WINEPREFIX: ${{ runner.temp }}/wine
+          WINEDEBUG: -all
 
   ci:
     if: always()
-    needs: [changes, build, checks, action, live-db, docker, plain-language, other-os]
-    runs-on: ubuntu-latest
+    needs: [changes, build, checks, action, live-db, docker, plain-language, windows]
+    runs-on: sylphx-linux-standard
     timeout-minutes: 5
     steps:
       - name: Every job that ran passed
